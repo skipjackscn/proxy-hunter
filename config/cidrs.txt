@@ -2,7 +2,4 @@
 # One IPv4 CIDR per line. This file is intentionally empty by default.
 154.41.80.0/24
 154.64.235.0/24
-154.64.236.0/24
-154.29.150.0/24
-154.64.224.0/24
-154.9.224.0/24
+
