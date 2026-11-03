@@ -1,0 +1,12 @@
+{
+  "authorized_scope_ack": false,
+  "max_hosts": 256,
+  "max_concurrency": 40,
+  "requests_per_second": 12,
+  "connect_timeout_seconds": 2.5,
+  "request_timeout_seconds": 7.0,
+  "verify_url": "https://api.ipify.org?format=json",
+  "history_limit": 30,
+  "successes_per_endpoint": 1,
+  "retry_failed_protocols": false
+}
