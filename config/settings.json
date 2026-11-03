@@ -1,5 +1,5 @@
 {
-  "authorized_scope_ack": false,
+  "authorized_scope_ack": true,
   "max_hosts": 256,
   "max_concurrency": 40,
   "requests_per_second": 12,
