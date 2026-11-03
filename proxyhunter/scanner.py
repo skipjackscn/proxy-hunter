@@ -17,6 +17,7 @@ import httpx
 ROOT = Path(__file__).resolve().parents[1]
 LOG = logging.getLogger("proxyhunter")
 DEFAULT_SETTINGS = ROOT / "config/settings.json"
+PROTOCOLS = ("socks5", "http", "https")
 
 
 def load_lines(path: Path) -> list[str]:
@@ -111,15 +112,15 @@ async def verify_proxy(host: str, port: int, protocol: str, settings: dict[str, 
     scheme = {"socks5": "socks5h", "http": "http", "https": "https"}[protocol]
     proxy_url = f"{scheme}://{host}:{port}"
     verify_url = normalize_verify_url(str(settings.get("verify_url", "https://api.ipify.org?format=json")))
-    timeout = httpx.Timeout(float(settings.get("request_timeout_seconds", 7.0)),
-                            connect=float(settings.get("connect_timeout_seconds", 2.5)))
+    timeout = httpx.Timeout(float(settings.get("request_timeout_seconds", 4.0)),
+                            connect=float(settings.get("connect_timeout_seconds", 1.5)))
     async with semaphore:
         await limiter.wait()
         started = time.perf_counter()
         try:
             async with httpx.AsyncClient(proxy=proxy_url, timeout=timeout, trust_env=False,
                                          follow_redirects=False, verify=True) as client:
-                response = await client.get(verify_url, headers={"User-Agent": "ProxyHunter/1.0"})
+                response = await client.get(verify_url, headers={"User-Agent": "ProxyHunter/2.0"})
                 response.raise_for_status()
                 body = response.text.strip()
                 try:
@@ -139,53 +140,134 @@ async def verify_proxy(host: str, port: int, protocol: str, settings: dict[str, 
                     "status": "alive",
                 }
         except Exception as exc:
-            # A reachable port may speak an invalid or unexpected protocol.
-            # Treat every per-endpoint handshake/transport failure as a dead
-            # candidate so one malformed SOCKS5/HTTP service cannot abort a scan.
+            # One malformed or incompatible endpoint must never abort the scan.
             LOG.debug("%s://%s:%s failed: %s", protocol, host, port, type(exc).__name__)
             return None
 
 
-async def run_scan(settings: dict[str, Any], hosts: list[ipaddress.IPv4Address], ports: list[int]) -> list[dict[str, Any]]:
-    concurrency = max(1, min(int(settings.get("max_concurrency", 40)), 200))
-    rate = max(0.5, min(float(settings.get("requests_per_second", 12)), 50.0))
-    timeout = max(0.5, min(float(settings.get("connect_timeout_seconds", 2.5)), 10.0))
-    limiter = RateLimiter(rate)
-    semaphore = asyncio.Semaphore(concurrency)
-    tcp_semaphore = asyncio.Semaphore(concurrency)
-    candidates: list[tuple[str, int]] = []
-    total = len(hosts) * len(ports)
-    done = 0
+async def run_scan(settings: dict[str, Any], hosts: list[ipaddress.IPv4Address],
+                   ports: list[int]) -> list[dict[str, Any]]:
+    tcp_concurrency = max(1, min(int(settings.get("tcp_concurrency", 100)), 200))
+    verify_concurrency = max(1, min(int(settings.get("verify_concurrency", 100)), 200))
+    tcp_rate = max(0.5, min(float(settings.get("tcp_requests_per_second", 40)), 100.0))
+    verify_rate = max(0.5, min(float(settings.get("verify_requests_per_second", 40)), 100.0))
+    tcp_timeout = max(0.5, min(float(settings.get("connect_timeout_seconds", 1.5)), 10.0))
+    queue_size = max(verify_concurrency, min(int(settings.get("queue_size", 1000)), 10000))
 
-    async def probe(host: ipaddress.IPv4Address, port: int) -> None:
-        nonlocal done
-        async with tcp_semaphore:
-            is_open = await tcp_open(str(host), port, timeout, limiter)
-        if is_open:
-            candidates.append((str(host), port))
-        done += 1
-        if done % 100 == 0 or done == total:
-            LOG.info("TCP checks: %d/%d; open endpoints: %d", done, total, len(candidates))
-
-    await asyncio.gather(*(probe(host, port) for host in hosts for port in ports))
-    LOG.info("TCP phase complete: %d open endpoint(s)", len(candidates))
-
-    tasks = []
-    for host, port in candidates:
-        for protocol in ("socks5", "http", "https"):
-            tasks.append(verify_proxy(host, port, protocol, settings, limiter, semaphore))
+    tcp_limiter = RateLimiter(tcp_rate)
+    verify_limiter = RateLimiter(verify_rate)
+    tcp_queue: asyncio.Queue[tuple[str, int] | None] = asyncio.Queue(
+        maxsize=max(tcp_concurrency * 4, 200))
+    verify_queues: dict[str, asyncio.Queue[tuple[str, int] | None]] = {
+        protocol: asyncio.Queue(maxsize=queue_size) for protocol in PROTOCOLS
+    }
+    verify_semaphore = asyncio.Semaphore(verify_concurrency)
     results: list[dict[str, Any]] = []
-    for result in await asyncio.gather(*tasks):
-        if result:
-            results.append(result)
+    total_tcp = len(hosts) * len(ports)
+    stats: dict[str, Any] = {
+        "tcp_done": 0, "tcp_open": 0,
+        **{f"{protocol}_done": 0 for protocol in PROTOCOLS},
+        **{f"{protocol}_alive": 0 for protocol in PROTOCOLS},
+    }
+
+    async def tcp_worker() -> None:
+        while True:
+            item = await tcp_queue.get()
+            try:
+                if item is None:
+                    return
+                host, port = item
+                if await tcp_open(host, port, tcp_timeout, tcp_limiter):
+                    stats["tcp_open"] += 1
+                    # Publish each newly discovered endpoint immediately.
+                    for protocol in PROTOCOLS:
+                        await verify_queues[protocol].put((host, port))
+                stats["tcp_done"] += 1
+            finally:
+                tcp_queue.task_done()
+
+    async def protocol_worker(protocol: str) -> None:
+        queue = verify_queues[protocol]
+        while True:
+            item = await queue.get()
+            try:
+                if item is None:
+                    return
+                host, port = item
+                result = await verify_proxy(
+                    host, port, protocol, settings, verify_limiter, verify_semaphore)
+                stats[f"{protocol}_done"] += 1
+                if result is not None:
+                    stats[f"{protocol}_alive"] += 1
+                    results.append(result)
+            finally:
+                queue.task_done()
+
+    async def progress_reporter(done_event: asyncio.Event) -> None:
+        while not done_event.is_set():
+            try:
+                await asyncio.wait_for(done_event.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                LOG.info(
+                    "PROGRESS TCP %d/%d open=%d | SOCKS5 %d/%d alive=%d | "
+                    "HTTP %d/%d alive=%d | HTTPS %d/%d alive=%d | queues tcp=%d "
+                    "socks5=%d http=%d https=%d",
+                    stats["tcp_done"], total_tcp, stats["tcp_open"],
+                    stats["socks5_done"], stats["tcp_open"], stats["socks5_alive"],
+                    stats["http_done"], stats["tcp_open"], stats["http_alive"],
+                    stats["https_done"], stats["tcp_open"], stats["https_alive"],
+                    tcp_queue.qsize(), verify_queues["socks5"].qsize(),
+                    verify_queues["http"].qsize(), verify_queues["https"].qsize(),
+                )
+
+    LOG.info(
+        "Pipeline started: TCP workers=%d rate=%.1f/s; verify workers=%d rate=%.1f/s",
+        tcp_concurrency, tcp_rate, verify_concurrency, verify_rate)
+    reporter_done = asyncio.Event()
+    reporter = asyncio.create_task(progress_reporter(reporter_done))
+    tcp_workers = [asyncio.create_task(tcp_worker()) for _ in range(tcp_concurrency)]
+    protocol_workers = [
+        asyncio.create_task(protocol_worker(protocol))
+        for protocol in PROTOCOLS
+        for _ in range(verify_concurrency)
+    ]
+
+    try:
+        for host in hosts:
+            for port in ports:
+                await tcp_queue.put((str(host), port))
+        for _ in tcp_workers:
+            await tcp_queue.put(None)
+        await tcp_queue.join()
+        await asyncio.gather(*tcp_workers)
+        LOG.info("TCP phase complete: %d/%d checks; %d open endpoint(s)",
+                 stats["tcp_done"], total_tcp, stats["tcp_open"])
+
+        # No more TCP discoveries are possible; let each protocol pool drain.
+        for protocol in PROTOCOLS:
+            for _ in range(verify_concurrency):
+                await verify_queues[protocol].put(None)
+        await asyncio.gather(*(queue.join() for queue in verify_queues.values()))
+        await asyncio.gather(*protocol_workers)
+    finally:
+        reporter_done.set()
+        await reporter
+
     results.sort(key=lambda item: item["latency_ms"])
+    LOG.info(
+        "Verification complete: SOCKS5 %d/%d alive=%d; HTTP %d/%d alive=%d; "
+        "HTTPS %d/%d alive=%d",
+        stats["socks5_done"], stats["tcp_open"], stats["socks5_alive"],
+        stats["http_done"], stats["tcp_open"], stats["http_alive"],
+        stats["https_done"], stats["tcp_open"], stats["https_alive"],
+    )
     return results
 
 
 def write_outputs(results: list[dict[str, Any]], settings: dict[str, Any], hosts_count: int,
                   ports_count: int) -> dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    protocols = {name: [r for r in results if r["protocol"] == name] for name in ("socks5", "http", "https")}
+    protocols = {name: [r for r in results if r["protocol"] == name] for name in PROTOCOLS}
     summary = {
         "checked_at": now,
         "scope": {"hosts_considered": hosts_count, "ports_configured": ports_count},
