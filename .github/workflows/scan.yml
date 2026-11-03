@@ -37,9 +37,21 @@ jobs:
         run: pip install -r requirements.txt
       - name: Test scope protections
         run: python -m unittest discover -s tests -v
+      - name: Check scan configuration
+        id: scope
+        shell: bash
+        run: |
+          if grep -Ev '^[[:space:]]*(#|$)' config/cidrs.txt | grep -q . && python -c 'import json; assert json.load(open("config/settings.json"))["authorized_scope_ack"] is True'; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "No acknowledged CIDR scope configured; scan skipped safely."
+          fi
       - name: Run authorized-scope scan
+        if: ${{ steps.scope.outputs.enabled == 'true' }}
         run: python -m proxyhunter --config config/settings.json
       - name: Commit scan results
+        if: ${{ steps.scope.outputs.enabled == 'true' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
