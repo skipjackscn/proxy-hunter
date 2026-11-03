@@ -138,7 +138,10 @@ async def verify_proxy(host: str, port: int, protocol: str, settings: dict[str, 
                     "exit_ip": exit_ip,
                     "status": "alive",
                 }
-        except (httpx.HTTPError, OSError, ValueError, asyncio.TimeoutError) as exc:
+        except Exception as exc:
+            # A reachable port may speak an invalid or unexpected protocol.
+            # Treat every per-endpoint handshake/transport failure as a dead
+            # candidate so one malformed SOCKS5/HTTP service cannot abort a scan.
             LOG.debug("%s://%s:%s failed: %s", protocol, host, port, type(exc).__name__)
             return None
 
