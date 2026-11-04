@@ -1,0 +1,14 @@
+{
+  "checked_at": "2026-11-04T03:09:24+00:00",
+  "scope": {
+    "hosts_considered": 508,
+    "ports_configured": 14
+  },
+  "summary": {
+    "total_alive": 0,
+    "socks5": 0,
+    "http": 0,
+    "https": 0
+  },
+  "proxies": []
+}
