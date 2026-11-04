@@ -7,7 +7,7 @@ on:
 
 concurrency:
   group: proxy-hunter-scan
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -48,6 +48,7 @@ jobs:
             echo "No acknowledged CIDR scope configured; scan skipped safely."
           fi
       - name: Run authorized-scope scan
+        timeout-minutes: 30
         if: ${{ steps.scope.outputs.enabled == 'true' }}
         run: python -m proxyhunter --config config/settings.json
       - name: Commit scan results
