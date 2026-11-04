@@ -118,27 +118,31 @@ async def verify_proxy(host: str, port: int, protocol: str, settings: dict[str, 
         await limiter.wait()
         started = time.perf_counter()
         try:
-            async with httpx.AsyncClient(proxy=proxy_url, timeout=timeout, trust_env=False,
-                                         follow_redirects=False, verify=True) as client:
-                response = await client.get(verify_url, headers={"User-Agent": "ProxyHunter/2.0"})
-                response.raise_for_status()
-                body = response.text.strip()
-                try:
-                    payload = response.json()
-                    exit_ip = str(payload.get("ip", "")).strip() if isinstance(payload, dict) else body
-                except (ValueError, TypeError):
-                    exit_ip = body
-                ipaddress.ip_address(exit_ip)
-                latency_ms = round((time.perf_counter() - started) * 1000, 2)
-                return {
-                    "protocol": protocol,
-                    "host": host,
-                    "port": port,
-                    "uri": f"{protocol}://{host}:{port}",
-                    "latency_ms": latency_ms,
-                    "exit_ip": exit_ip,
-                    "status": "alive",
-                }
+            # Enforce a hard wall-clock limit around the complete proxy handshake
+            # and HTTP exchange. Some SOCKS5 peers can stall outside httpx's
+            # phase-specific socket timeouts.
+            async with asyncio.timeout(float(settings.get("verification_hard_timeout_seconds", 8.0))):
+                async with httpx.AsyncClient(proxy=proxy_url, timeout=timeout, trust_env=False,
+                                             follow_redirects=False, verify=True) as client:
+                    response = await client.get(verify_url, headers={"User-Agent": "ProxyHunter/2.0"})
+                    response.raise_for_status()
+                    body = response.text.strip()
+                    try:
+                        payload = response.json()
+                        exit_ip = str(payload.get("ip", "")).strip() if isinstance(payload, dict) else body
+                    except (ValueError, TypeError):
+                        exit_ip = body
+                    ipaddress.ip_address(exit_ip)
+                    latency_ms = round((time.perf_counter() - started) * 1000, 2)
+                    return {
+                        "protocol": protocol,
+                        "host": host,
+                        "port": port,
+                        "uri": f"{protocol}://{host}:{port}",
+                        "latency_ms": latency_ms,
+                        "exit_ip": exit_ip,
+                        "status": "alive",
+                    }
         except Exception as exc:
             # One malformed or incompatible endpoint must never abort the scan.
             LOG.debug("%s://%s:%s failed: %s", protocol, host, port, type(exc).__name__)
@@ -194,8 +198,15 @@ async def run_scan(settings: dict[str, Any], hosts: list[ipaddress.IPv4Address],
                 if item is None:
                     return
                 host, port = item
-                result = await verify_proxy(
-                    host, port, protocol, settings, verify_limiter, verify_semaphore)
+                try:
+                    result = await verify_proxy(
+                        host, port, protocol, settings, verify_limiter, verify_semaphore)
+                except Exception as exc:
+                    # Keep a single unexpected worker error from killing the pool
+                    # and leaving queue.join() waiting forever.
+                    LOG.warning("%s://%s:%s worker error: %s",
+                                protocol, host, port, type(exc).__name__)
+                    result = None
                 stats[f"{protocol}_done"] += 1
                 if result is not None:
                     stats[f"{protocol}_alive"] += 1
