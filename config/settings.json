@@ -11,5 +11,6 @@
   "verify_url": "https://api.ipify.org?format=json",
   "history_limit": 30,
   "successes_per_endpoint": 1,
-  "retry_failed_protocols": false
+  "retry_failed_protocols": false,
+  "verification_hard_timeout_seconds": 8
 }
