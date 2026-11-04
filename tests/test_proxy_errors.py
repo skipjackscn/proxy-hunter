@@ -29,6 +29,30 @@ class ProxyVerificationErrorTests(unittest.TestCase):
         self.assertIsNone(asyncio.run(run()))
 
 
+class StalledProxyClient:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def get(self, *args, **kwargs):
+        await asyncio.Event().wait()
+
+
+class ProxyVerificationTimeoutTests(unittest.TestCase):
+    def test_stalled_socks_handshake_is_killed_by_hard_timeout(self):
+        async def run():
+            with patch("proxyhunter.scanner.httpx.AsyncClient", return_value=StalledProxyClient()):
+                return await verify_proxy(
+                    "192.0.2.11", 1080, "socks5",
+                    {"verify_url": "https://api.ipify.org?format=json",
+                     "verification_hard_timeout_seconds": 0.05},
+                    RateLimiter(100000), asyncio.Semaphore(1),
+                )
+        self.assertIsNone(asyncio.run(run()))
+
+
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_protocol_verification_starts_before_tcp_scan_finishes(self):
         verification_started = asyncio.Event()
