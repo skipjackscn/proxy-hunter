@@ -1,7 +1,7 @@
 {
-  "checked_at": "2026-11-04T03:09:24+00:00",
+  "checked_at": "2026-11-04T03:40:47+00:00",
   "scope": {
-    "hosts_considered": 508,
+    "hosts_considered": 1016,
     "ports_configured": 14
   },
   "summary": {
