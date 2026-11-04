@@ -1,5 +1,6 @@
 # Add only CIDR ranges that you own or are explicitly authorized to assess.
 # One IPv4 CIDR per line. This file is intentionally empty by default.
-154.41.80.0/24
-154.64.235.0/24
+38.244.2.0/24
+38.244.3.0/24
+38.244.5.0/24
 
